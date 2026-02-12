@@ -25,7 +25,6 @@ typedef struct _Block_Metadata{
     struct _Block_Metadata *prev;
 } block_metadata;
 
-void init_malloc();
 void *malloc(size_t size);
 void free(void*);
 size_t get_heap_usage();

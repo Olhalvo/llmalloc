@@ -1,14 +1,11 @@
 #include "../inc/llmalloc.h"
-#include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <unistd.h>
 
-static void* heap_tail = NULL; //effectively const, if u call the init function twice ure retarded 
-static void* heap_head = NULL;
+static block_metadata* heap_tail = NULL; //effectively const, if u call the init function twice ure retarded 
+static block_metadata* heap_head = NULL;
 
 static size_t total_size = 0;
 
@@ -19,22 +16,56 @@ static block_metadata *split(block_metadata *, size_t);
 inline static size_t align(const size_t);
 inline static size_t trim_top();
 
-void init_malloc(){
-    if(!heap_tail && !heap_head){
-        heap_tail = sbrk(0);
+
+int heap_check(void) {
+    if (!heap_tail) return 0;
+    size_t meta = align(sizeof(block_metadata));
+    block_metadata *cur = heap_tail;
+    // basic cycle detection (Floyd) to catch cycles quickly
+    block_metadata *slow = cur, *fast = cur;
+    while (fast) {
+        fast = fast->next;
+        if (!fast) break;
+        fast = fast->next;
+        slow = slow->next;
+        if (fast == slow) {
+            write(1, "heap_check: cycle detected\n", 27);
+            return 1;
+        }
     }
+
+    // physical adjacency + prev/next coherence
+    while (cur) {
+        // prev/next coherence
+        if (cur->next && cur->next->prev != cur) {
+            write(1, "heap_check: next->prev mismatch\n", 33);
+            return 2;
+        }
+        if (cur->prev && cur->prev->next != cur) {
+            write(1, "heap_check: prev->next mismatch\n", 33);
+            return 3;
+        }
+        // physical adjacency check
+        if (cur->next) {
+            uintptr_t expected_next = (uintptr_t)cur + meta + cur->size;
+            if ((uintptr_t)cur->next != expected_next) {
+                write(1, "heap_check: non-contiguous physical layout\n", 43);
+                return 4;
+            }
+        }
+        cur = cur->next;
+    }
+    return 0;
 }
 
+
 void* malloc(const size_t size){
-    if(!heap_tail){
-        errno = ENOTINIT;
-        return NULL;
-    }
     size_t aligned_size = align(size);
     void *temp = preallocated(aligned_size);
     if(!temp){
        temp = expand_heap(aligned_size);
     }
+    heap_check();
     return temp;
 }
 
@@ -58,56 +89,63 @@ static void *preallocated(const size_t size){
 }
 
 //returns the new split block
+
 static block_metadata *split(block_metadata *block, size_t size){
-    if(size == block->size){
+    size_t space_to_open = (size + align(sizeof(block_metadata)));
+    if(block->size < space_to_open + MY_MALLOC_ALIGN){
         block->free = false;
+        //if block is exactly the allocated size(or too tiny for splitting) just give it like a perfect fit
         return block;
     }
-    block_metadata *next = block->next;
-    size_t space_to_open = (size + align(sizeof(block_metadata)));
-    block_metadata *new;
-    if(next){
-        new = (void*)((uint8_t*)next - space_to_open);
-        next->prev = new;
+    block_metadata *new = (void*)((uint8_t*)block + space_to_open);
+    new->size = block->size - space_to_open;
+    new->next = block->next;
+    if(new->next){
+        new->next->prev = new;
     }
-    else
-        new = (void*)((uint8_t*)block + ((align(sizeof(block_metadata))+block->size) - space_to_open));
-    block->next = new;
-    block->size -=space_to_open;
+    else{
+        heap_head = new;
+    }
+    new->free = true;
     new->prev = block;
-    new->next = next;
-    new->free = false;
-    new->size = size;
-    return new;
+    block->next = new;
+    block->size = size;
+    block->free = false;
+    return block;
 }
 
 static void *expand_heap(const size_t size){
-     block_metadata metadata = {
+    block_metadata metadata = {
         .size = size,
         .free = false,
-        .next = NULL
+        .next = NULL,
+        .prev = NULL
     };
     size_t effective_size = size+align(sizeof(block_metadata));
     block_metadata *temp_head = sbrk(effective_size);
     if(temp_head == (void*)-1){
-        perror("Out of memory\n");
         return NULL;
     }
     *temp_head = metadata;
     if(heap_head){
-        ((block_metadata*)heap_head)->next = temp_head;
+        heap_head->next = temp_head;
         temp_head->prev = heap_head;
     }
     heap_head = temp_head;
     total_size+=effective_size;
+    if(!heap_tail){
+        heap_tail = heap_head;
+    }
     return (uint8_t*)temp_head + align(sizeof(block_metadata));
 }
 
 void free(void *block){
-    block_metadata *metadata = ((block_metadata*)block)-1;
+    if(!block){
+        return;
+    }
+    block_metadata *metadata = (void*)((uint8_t*)block-align(sizeof(block_metadata)));
     if(metadata->free){
         errno = EALREADYFREE;
-        perror("Trying to free already free'd memory");
         return;
     }
     metadata->free = true;
@@ -117,45 +155,31 @@ void free(void *block){
     }
     if(total_size > PREALLOC_TRESHOLD){
         total_size -= trim_top();
-
     }
+    heap_check();
 }
 
 
-static block_metadata *coalesce(block_metadata *metadata){
-    block_metadata *prev = metadata->prev;
-    block_metadata *next = metadata->next;
-    block_metadata *ret = NULL;
-    size_t size = metadata->size;
-    size_t size_pre = size;
-    if(prev && prev->free){
-        size_pre += prev->size;
-        size += prev->size ;
-        size += align(sizeof(block_metadata));
-        if(next && next->free){
-            size_pre+=next->size;
-            size+=next->size;
-            size+=align(sizeof(block_metadata));
-            prev->next = next->next;
-        }
-        else 
-            prev->next = next;
-        if(prev->next)
-            prev->next->prev = prev;
-        ret = prev;
-    }else {
-        if(next && next->free){
-            size_pre += next->size;
-            size+=next->size;
-            size+=align(sizeof(block_metadata));
-            metadata->next = next->next;
-            if(metadata->next)
-                metadata->next->prev = metadata;
-        }
-        ret = metadata;
+static block_metadata *coalesce(block_metadata *block){
+    // Merge with previous
+    if (block->prev && block->prev->free) {
+        block_metadata *prev = block->prev;
+        prev->size += align(sizeof(block_metadata)) + block->size;
+        prev->next = block->next;
+        if (block->next)
+            block->next->prev = prev;
+        block = prev;
     }
-    ret->size = size;
-    return ret;
+
+    // Merge with next
+    if (block->next && block->next->free) {
+        block_metadata *next = block->next;
+        block->size += align(sizeof(block_metadata)) + next->size;
+        block->next = next->next;
+        if (next->next)
+            next->next->prev = block;
+    }
+    return block;
 }
 
 inline static size_t trim_top(){
@@ -163,7 +187,7 @@ inline static size_t trim_top(){
         return 0;
 
 
-    block_metadata *last_block = (block_metadata *) heap_head;
+    block_metadata *last_block = heap_head;
 
 
     if(last_block->free){
